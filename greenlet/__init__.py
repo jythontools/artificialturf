@@ -1,4 +1,6 @@
 # artificialturf - emulation of greenlet using threads
+# For performance reasons, this should be rewritten to use Java once expose is available
+
 
 import sys
 import threading
@@ -9,11 +11,11 @@ from java.util.concurrent import ArrayBlockingQueue
 class error(Exception):
     pass
 
+
 class GreenletExit(Exception):
     pass
 
 
-context = threading.local()
 ROOT = object()
 print "root", ROOT
 
@@ -23,11 +25,13 @@ GreenletException = namedtuple("GreenletException", ["typ", "val", "tb"])
 
 
 def getcurrent():
+    # This should not be called when the root greenlet is initialized
     print "getcurrent: thread local context", context._current
     return context._current
 
 
 def _handle_result(result, applicable=False):
+    # This fairly complex logic models the C implementation
     if isinstance(result, GreenletArgs):
         if applicable:
             return result.args, result.kwargs
@@ -50,10 +54,21 @@ class greenlet(object):
 
     def __init__(self, run=None, parent=None):
         self.run = run
-        if parent is not None:
+        if parent is ROOT:
+            self.parent = None
+        elif parent is not None:
             self.parent = parent
         else:
-            self.parent = getcurrent()
+            parent = getcurrent()
+            print "Setting parent", parent
+            self.parent = parent
+            self._frame = self._mailbox = None
+            self._thread = threading.current_thread() # temp FIXME
+            print "Set the parent {} {}".format(self, self.parent)
+
+        # Top user frame of this greenlet; per the normal C
+        # implementation of greenlet, this is only available during
+        # the execution of the greenlet - not when it's not running
         self._frame = None
 
         # Mailbox is used in this code to highlight that it's a specialized
@@ -61,27 +76,46 @@ class greenlet(object):
         # greenlet.switch
         self._mailbox = ArrayBlockingQueue(1)
 
-        self._thread = threading.Thread(target=self._wrapper)
-        self._thread.daemon = True  # greenlets don't block exit
-        self._thread.start()
+        # Set up thread for the actual emulation. This could be a
+        # lightweight thread, such as provided by Quasar
+        if self.parent is None:
+            # Special case root greenlets
+            self._thread = threading.current_thread()
+        else:
+            self._thread = threading.Thread(target=self._wrapper)
+            self._thread.setDaemon(True)  # greenlets don't block exit; FIXME apparently daemon=True doesn't yet work on Jython
+            self._thread.start()  # the wrapper will immediately block on its mailbox
+
+        print "Initialized greenlet {}".format(self)
+
 
     def __str__(self):
-        return "<greenlet id={}, parent={}, frame={}, mailbox={}, thread={}>".format(
-            id(self), id(self.parent) if self.parent else None, self._frame, self._mailbox, self._thread.name)
+        if self.parent is None:
+            parent_id = None
+        else:
+            parent_id = "{:#x}".format(id(self.parent))
+        return "<greenlet id={:#x}, parent={}, frame={}, mailbox={}, thread={} daemon={}>".format(
+            id(self), parent_id, self._frame, self._mailbox, self._thread.name, self._thread.isDaemon())
+
+    __repr__ = __str__
+
+    def _propagate(self, *args, **kwargs):
+        print "In switch to parent for {} from {}".format(self, context._current)
+        self._mailbox.add(GreenletArgs(args, kwargs))
 
     def switch(self, *args, **kwargs):
         # Using add ensures that we will quickly fail if multiple greenlets
         # switch to the same one. Should not happen in actual greenlets,
         # and presumably the user-directed scheduling of switch should ensure
         # the same for this emulation
-        print "In switch for", self
-        if self.parent is ROOT:
-            print "Returning from switch to root of tree"
-            return
+        print "In switch for {} from {}".format(self, context._current)
         self._mailbox.add(GreenletArgs(args, kwargs))
         self._frame = sys._getframe(-1)  # caller
         try:
-            return _handle_result(context._current._mailbox.take())
+            print "Waiting on mailbox from switched away greenlet {}".format(context._current)
+            result = _handle_result(context._current._mailbox.take())
+            print "Completed waiting on mailbox from switched away greenlet {} result={} thread={}".format(context._current, result,  threading.current_thread())
+            return result
         finally:
             self._frame = None
 
@@ -106,6 +140,8 @@ class greenlet(object):
         return self._frame
 
     def __nonzero__(self):
+        # NB: defining this method makes for tests to be more interesting than usual;
+        # always need to compare a greenlet is None instead of if greenlet!
         return self._thread.is_alive() and not hasattr(self, "run")
  
     def _wrapper(self):
@@ -126,10 +162,10 @@ class greenlet(object):
             print "Completed greenlet thread {}".format(self._thread.name)
 
         # Switch up the parent hierarchy
-        print "Switching to parent={} result={}".format(self.parent, result)
-        if self.parent: # is not None:
-            self.parent.switch(result)
-        print "BYE"
+        if self.parent is not None:
+            print "Switching to parent={} result={} from context={}".format(self.parent, result, context._current)
+            self.parent._propagate(result)
+        print "Completed greenlet {}".format(self)
 
     def __del__(self):
         self.throw()
@@ -142,6 +178,10 @@ class greenlet(object):
 # model. But it needs to retrieve the alice context. As we usually do
 # in such cases, we model this context with a thread local.
 
+context = threading.local()
+
+# Subsequent greenlet calls in this thread should get this parent;
+# but what about other threads? FIXME
 context._current = greenlet(run=None, parent=ROOT)
 
-print "Initialized context greenlet", context._current
+print "context._current", context._current
